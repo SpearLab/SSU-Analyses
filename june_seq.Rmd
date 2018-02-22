@@ -1,0 +1,1324 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+---
+title: "June Seq Bioinformatics"
+output:
+  html_document: default
+  html_notebook: default
+---
+##Analysis steps:
+
+* View sequencing quality profiles
+* Based on Sequence quality trim nt from left and right
+* dereplicate
+* Perform joint sample inference and error rate estimation
+* merge paired ends
+* construct sequence table
+* remove chimeras
+* rowSums(sequence table) >> remove samples with low sequence counts
+* colSums >> remove samples with low OTU observations 
+* assign taxonomy (RDP, Greengenes, Silva)
+* add species (if RDP or Silva were used)
+* rename columns of taxonomy table (KPCOFGS)
+* write sequence table and taxonomy table to file
+* write unique sequences to file
+*work in Qiime:
+    * align unique sequences using pynast
+    * make a tree
+* import tree into R
+* bring in meta data
+* create phyloseq object (include tree)
+* EDA on phyloseq object (heatmaps, box plots, etc.)
+* Alpha diversity
+    * use categorical groupings that make sense 
+* Beta diversity
+    * run untrimmed and trimmed;  can subset taxonomy and re-run (eg. Bacteria only)
+* group significance (Adonis, anosim, etc.)
+
+## try http:// if https:// URLs are not supported
+```{r, message=FALSE, warning=FALSE, include=FALSE}
+source("https://bioconductor.org/biocLite.R")
+#biocLite("BioCheck")
+#biocLite("BiocUpgrade")
+biocLite()
+```
+
+
+## Here we install dependencies for ampvis (from GitHub)
+```{r, message=FALSE, warning=FALSE, include=FALSE}
+biocLite("Biostrings")
+biocLite("DESeq2")
+biocLite("phyloseq")
+biocLite("munsell")
+biocLite("stringi")
+biocLite("chron")
+biocLite("permute")
+biocLite("assertthat")
+biocLite("tibble")
+biocLite("rmarkdown")
+biocLite("readxl")
+biocLite("dada2")
+biocLite("dplyr")
+install.packages("remotes")
+remotes::install_github("MadsAlbertsen/ampvis2")
+```
+
+#Loading the libraries that we need to work in R.
+```{r, message=FALSE, warning=FALSE, include=FALSE}
+ptm <- proc.time()
+library(ggplot2)
+library(phyloseq); packageVersion("phyloseq")
+library(ShortRead)
+library(dada2)
+library(ape); packageVersion('ape') #library for creating  tree
+library(dplyr)
+library(vegan)
+library(ampvis2)
+library(DESeq2)
+library(cowplot)
+library(grid)
+library(cowplot)
+```
+
+
+#Loading the raw data into variables so that we can work with it.
+#Looking at sequence quality profiles to see the quality of the sequencing run. Remember, a Q score of 30 means a 1/1000 chance of error; the three comes from log scale 3.
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+path<-"/Volumes/Honeyman_LabData/Duke_Center/0617_Submission/Raw_Data/Concatenation/Concatenated_files_snow/" #set path
+fns <- list.files(path)
+fastqs <- fns[grepl(".fastq$", fns)]
+fastqs <- sort(fastqs) # Sort ensures forward/reverse reads are in same order
+fnFs <- fastqs[grepl("_r1", fastqs)] # Just the forward read files
+fnRs <- fastqs[grepl("_r2", fastqs)] # Just the reverse read files
+# Get sample names from the first part of the forward read filenames
+sample.names <- fnFs
+#sample.names <- sapply(strsplit(sample.names, "_"), `[`, 1)#removes everything after real sample name
+# Fully specify the path for the fnFs and fnRs
+fnFs <- paste0(path, fnFs)
+fnRs <- paste0(path, fnRs)
+
+
+plotQualityProfile(fnFs[[1]])
+plotQualityProfile(fnFs[[18]])
+plotQualityProfile(fnFs[[30]])
+
+
+
+plotQualityProfile(fnRs[[1]])
+plotQualityProfile(fnRs[[18]])
+plotQualityProfile(fnRs[[30]])
+
+
+```
+
+
+
+
+#Based on Sequence quality trim 40? (F primer len?) nt from left of F.
+#R primer length is 20, so trim 20nt from left of R.
+#Use the entire read length available (239, 251) without truncation. If done, there is only an overlap of 9 between R1 and R2. Not much room to work with; but, given our high quality reads this may be okay.
+```{r, message=TRUE, warning=TRUE, include=FALSE}
+ptm <- proc.time()
+filtFs <- paste0(path, sample.names, "_F_filt.fastq.gz")
+filtRs <- paste0(path, sample.names, "_R_filt.fastq.gz")
+
+for(i in seq_along(fnFs)) {
+  fastqPairedFilter(c(fnFs[i], fnRs[i]), c(filtFs[i], filtRs[i]),
+                    trimLeft=c(40, 20), truncLen=c(239,251), 
+                    maxN=0, maxEE=2, truncQ=2, 
+                    compress=TRUE, verbose=TRUE)
+}
+
+proc.time() - ptm
+```
+##dereplicate
+```{r,message=FALSE, warning=FALSE, include=FALSE}
+ptm <- proc.time()
+derepFs <- derepFastq(filtFs, verbose=TRUE) #dereplicate
+derepRs <- derepFastq(filtRs, verbose=TRUE) #dereplicate
+# Name the derep-class objects by the sample names
+names(derepFs) <- sample.names
+names(derepRs) <- sample.names
+proc.time() - ptm
+```
+##Perform joint sample inference and error rate estimation
+```{r,message=FALSE, warning=FALSE, include=FALSE}
+ptm <- proc.time()
+dadaFs <- dada(derepFs, err=inflateErr(tperr1,3), selfConsist = TRUE, multithread = TRUE)
+dadaRs <- dada(derepRs, err=inflateErr(tperr1,3), selfConsist = TRUE, multithread = TRUE)
+proc.time() - ptm
+```
+
+##merge paired ends
+#Here we think about how many mismatches to allow, as well as how much of an overlap we need. Be sure to check that there actually will be enough overlap in your reads to meet the minOverlap. Otherwise, none of your sequences will pass this QC. BE SURE TO NOT RETURN REJECTS. Returning rejects is more than an 'accept' visualization; the sequences will actually be retained in downstream analyses.
+```{r,message=FALSE, warning=FALSE, include=FALSE}
+mergers <- mergePairs(dadaFs, derepFs, dadaRs, derepRs, maxMismatch = 0, minOverlap = 5, verbose=TRUE, returnRejects = FALSE)
+```
+
+#merge paried ends (SNOW EUKS).
+```{r,message=FALSE, warning=FALSE, include=FALSE}
+mergers_snow_euks <- mergePairs(dadaFs, derepFs, dadaRs, derepRs, maxMismatch = 0, minOverlap = 5, justConcatenate = TRUE, verbose=TRUE, returnRejects = TRUE)
+```
+
+##construct sequence table
+```{r,message=FALSE, warning=FALSE, include=FALSE}
+seqtab <- makeSequenceTable(mergers)
+```
+
+##construct sequence table (SNOW EUKS)
+```{r,message=FALSE, warning=FALSE, include=FALSE}
+seqtab_snow_euks <- makeSequenceTable(mergers_snow_euks)
+```
+
+##remove chimeras
+```{r,message=FALSE, warning=FALSE, include=FALSE}
+seqtab.nochim <- removeBimeraDenovo(seqtab, verbose=TRUE, multithread = TRUE)
+```
+
+##remove chimeras (SNOW EUKS)
+```{r,message=FALSE, warning=FALSE, include=FALSE}
+seqtab_snow_euks.nochim <- removeBimeraDenovo(seqtab_snow_euks, verbose=TRUE, multithread = TRUE)
+```
+
+##write sequence table to file
+```{r,message=FALSE, warning=FALSE, include=FALSE}
+write.csv(seqtab.nochim, file = "/Volumes/Honeyman_LabData/Full_Protocols/june_seq/seqtab_nochim.csv")
+```
+
+##write sequence table to file (SNOW EUKS)
+```{r,message=FALSE, warning=FALSE, include=FALSE}
+write.csv(seqtab_snow_euks.nochim, file = "/Volumes/Honeyman_LabData/Full_Protocols/june_seq/seqtab_snow_euks_nochim.csv")
+```
+
+
+
+##This code plots the actual row sums of OTUs from the sequence table. i.e. each sample is summed up for all of the observed sequences (sequence depth).
+#Note that this is just a graph to eyeball the sequence depth from the entire June run (all samples).
+```{r, echo=FALSE}
+sample_seq_counts <- rowSums(seqtab.nochim)
+
+plot(sample_seq_counts)
+
+```
+
+##The below code chunks immediately following one another are used to trim down the BA ps_object BEFORE rarefaction. We are doing this so that the Euks and BA datasets are comparable pre-rarefaction for looking at how many BA/Euks sequences were recovered in total.
+#Removing certain taxa groups that are uninformative for a Bacterial/Archaeal analysis. i.e. we remove Eukaryota, Chloroplasts, and Mitochondria.
+```{r}
+
+BA_for_seq_counts <- subset_taxa(snow_ps_mergeFix_BAs_tre, ((Kingdom != "Eukaryota")&(Class != "Chloroplast")&(Family != "Mitochondria")))
+
+```
+#Removing the control filters so that they are not part of sequence counts.
+```{r}
+BA_for_seq_counts <- subset_samples(BA_for_seq_counts, Location != "Control")
+
+```
+#Removing 111716_Golden_2 from anlaysis because the bead tube failed during extraction.
+```{r}
+BA_for_seq_counts <- subset_samples(BA_for_seq_counts, Sample != "111716_Golden_2")
+
+```
+#And here we are running the actual comparison of sequences recovered.
+#Bacterial/Archaeal sequences recovered vs. Eukaryotic sequences recovered in SNOW.
+```{r}
+#Note that both the BA and Euk ps objects used below have NOT been rarefied, but have had controls, bad sample, removed.
+rows_BA <- rowSums(otu_table(BA_for_seq_counts))
+
+rows_E <- rowSums(otu_table(snow_ps_euks_trim_BAout))
+
+all_sequences_BA <- sum(rows_BA)
+all_sequences_E <- sum(rows_E)
+
+print(all_sequences_BA)
+print(all_sequences_E)
+
+percent_euk <- ((all_sequences_E)/(all_sequences_BA + all_sequences_E))*100
+
+print(percent_euk)
+```
+
+
+##Making a new data table with sequence depth by sample. We can change the phyloseq object to any sub-group phyloseq object.
+```{r}
+
+seq_depth <- rowSums(otu_table(snow_ps)) #the subset phyloseq of interest
+seq_depth <- data.frame(seq_depth) #making it a data frame
+seq_depth[,2] <- row.names(seq_depth) #adding a column with the sample names
+colnames(seq_depth)[2] <- "Sample" #naming the new column "Sample"
+
+View(seq_depth)
+```
+
+
+##ggplot of the above.
+```{r}
+
+p <- ggplot(seq_depth, aes(x = Sample, y = seq_depth)) +
+  geom_point() + theme(axis.text.x = element_text(angle = 270, hjust = 1))
+
+
+```
+
+##ggplot like the above, but from the sample_data of the phyloseq object so that different variables can be used to plot seq_depth by.
+```{r}
+p <- ggplot(sample_data(snow_ps), aes(x= Location, y= seq_depth)) + geom_point() + theme(axis.text.x = element_text(angle = 270, hjust= 1))
+
+
+```
+
+##optional--remove sequence variants seen less than a given number of times 
+```{r, message=FALSE, warning=FALSE, include=FALSE}
+seqtab.nochim = seqtab.nochim[,colSums(seqtab.nochim) > 16]
+```
+
+#Code to save the original seqtab.nochim before the next code chunk. Also removes the column that is an issue for assignTaxonomy.
+```{r}
+original_seqtab.nochim <- seqtab.nochim #Here we save a unedited version of the seqtab.nochim. i.e. this version is before we remove the column with the total # OTUs seen in that sample.
+
+seqtab.nochim <- seqtab.nochim[,-1]
+
+```
+
+##assign taxonomy (RDP, Greengenes, Silva)
+#Note that we run the same call for snow euks, just using the seqtab.nochim that is used for euk sequences.
+```{r, message=FALSE, warning=FALSE, include=FALSE}
+#put in directory to a taxonomy database
+#Note that you may have to remove a column from the seqtab.nochim data frame. One of the columns is not actually an OTU name but is the total # OTUs seen in that sample. The program will be unable to ID the OTU name (since there is none) and will say that the OTU is not long enough to assign taxonomy. Removal of this "total OTUs" column should work.
+ptm <- proc.time()
+taxa_silva_snowBA <- assignTaxonomy(seqtab.nochim, "/Volumes/Honeyman_LabData/training_sets/silva/silva_nr_v128_train_set.fa.gz")
+proc.time() - ptm
+```
+
+##write taxonomy assignments to file
+```{r, message=FALSE, warning=FALSE, include=FALSE}
+write.csv(taxa_silva_snowBA, file = "/Volumes/Honeyman_LabData/Full_Protocols/june_seq/snow_alignment/taxa_silva_snowBA.csv")
+```
+
+
+#change taxonomy from greengenes to silva
+#keep OTUS seen over 2 times in over 10% of samples.
+```{r}
+#wh0 = genefilter_sample(ps, filterfun_sample(function(x) x > 2), A = 0.1 * nsamples(ps))
+#ps_pruned= prune_taxa(wh0, ps)
+
+ptm <- proc.time()
+
+test<-assignTaxonomy(colnames(otu_table(snow_ps)), "/Volumes/Honeyman_LabData/training_sets/silva/silva_nr_v128_train_set.fa.gz")
+
+test_species<-addSpecies(test, "/Volumes/Honeyman_LabData/training_sets/silva/silva_species_assignment_v128.fa.gz")
+
+snow_ps_silva <-phyloseq(otu_table(otu_table(snow_ps)), tax_table(test_species), sample_data(sample_data(snow_ps)))
+
+proc.time() - ptm
+```
+
+#Here is the code used to import an updated data table; in this case, we are importing an updated data table to be used with the ps object that has properly merged sequences. Note that we had to make a new metadata file because the sample names that we are merging with still have the 'c_' and 'output...', etc. naming convention.
+```{r}
+fixedMerged_meta <- data.frame(table_4fixing_merge)
+
+row.names(fixedMerged_meta) <- fixedMerged_meta$X1
+
+fixedMerged_meta <- fixedMerged_meta[,-c(1)]
+
+```
+
+##import metadata
+```{r, message=FALSE, warning=FALSE, include=FALSE}
+#click import dataset button in the environment panel, follow directions.  set sample name as row name using
+#row.names(metaDataFile)<-metaDataFile$sampleNameColumn
+#The $ allows you to access the column by its name.
+row.names(june_seq_meta_for_names)<-june_seq_meta_for_names$Sample
+```
+
+#Code to check the names
+```{r}
+#Checking to see that the row names were set correctly.
+row.names(june_seq_meta_for_names)
+sample_names(june_ps)
+```
+
+###The below two chunks were for snow euks.
+##invoke phyloseq object
+```{r, message=FALSE, warning=FALSE, include=FALSE}
+snow_ps_euks <- phyloseq(otu_table(seqtab_snow_euks.nochim, taxa_are_rows=FALSE), tax_table(taxa_silva_snow_euks), sample_data(sample_data(hold)))
+
+##Add this argument to the phyloseq object call when you want to add meta data.
+##sample_data(final_cat_Edgar_metadata), #change sample_data file to whatever you named it in the above code chunk
+```
+##save phyloseq object
+```{r}
+saveRDS(snow_ps_euks_trim_BAout_tre, '/Volumes/Honeyman_LabData/Full_Protocols/june_seq/subset_phyloseqs/snow_ps_euks_trim_BAout_tre.RDS')
+#saves the phyloseq object.  Can be read back in using readRDS
+```
+
+###The below two chunks are for snow BAs, after fixing the merging issue.
+##invoke phyloseq object
+```{r, message=FALSE, warning=FALSE, include=FALSE}
+snow_ps_mergeFix_BAs <- phyloseq(otu_table(seqtab.nochim, taxa_are_rows=FALSE), tax_table(taxa_silva_snowBA), sample_data(sample_data(fixedMerged_meta)))
+
+##Add this argument to the phyloseq object call when you want to add meta data.
+##sample_data(final_cat_Edgar_metadata), #change sample_data file to whatever you named it in the above code chunk
+```
+##save phyloseq object
+```{r}
+saveRDS(snow_ps_mergeFix_BAs, '/Volumes/Honeyman_LabData/Full_Protocols/june_seq/subset_phyloseqs/snow_ps_mergeFix_BAs.RDS')
+#saves the phyloseq object.  Can be read back in using readRDS
+```
+
+##Making a new seqtab.nochim with ONLY snow samples that can be used to generate a tree and phyloseq object.
+#Removing rows (samples) from the original seqtab.nochim file such that only snow samples exist. We only want to generate the tree using OTUs from the snow samples. Shouldn't matter algorithmically (could use entire seq. run to generate the tree), but is good practice for journal review to only generate information using the samples from the intended project.
+```{r}
+snow.seqtab.nochim <- seqtab.nochim[-c(9, 19, 26, 27:37, 47:49, 50:66),]
+
+#Checking that the names of the snow.seqtab.nochim and otu_table(snow_ps_silva) are in the same order.
+x <- rownames(snow.seqtab.nochim)
+y <- rownames(otu_table(snow_ps_silva))
+z <- setNames(x,y)
+z
+
+#If they ARE in the same order, we can copy the rownames from the phyloseq object to the rownames of the snow.seqtab.nochim. This will need to be done so that when the new phyloseq object is generated, the names of the two constituent files can be matched.
+rownames(snow.seqtab.nochim) <- rownames(otu_table(snow_ps_silva))
+
+```
+
+#Remove columns from snow.seqtab.nochim that have no OTU reads. These were OTUs seen in other samples on the run, but should be removed for the purpose of generating a tree from snow samples alone.
+```{r}
+snow.seqtab.nochim_rmd <- data.frame(snow.seqtab.nochim)
+cols_rm <- c()
+
+for (i in 1:ncol(snow.seqtab.nochim_rmd)){
+  if (colSums(snow.seqtab.nochim_rmd[i]) == 0){
+    cols_rm <- c(cols_rm, i)
+  }
+}
+
+```
+
+#Removing the columns (OTUs) from the snow.seqtab.nochim that have no reads.
+```{r}
+snow.seqtab.nochim_rmd <- snow.seqtab.nochim_rmd[,-c(cols_rm)]
+```
+
+#Making the snow.seqtab.nochim_rmd file into a type compatible with assignTaxonomy().
+```{r}
+
+snow.seqtab.nochim_rmd <- as.matrix(snow.seqtab.nochim_rmd)
+
+```
+
+#Making a phyloseq object with only OTUs seen in snow samples.
+```{r, message=FALSE, warning=FALSE, include=FALSE}
+snow_ps_snowOTUsOnly <- phyloseq(otu_table(snow.seqtab.nochim_rmd, taxa_are_rows=FALSE), tax_table(taxa_silva), sample_data(sample_data(snow_ps_silva)))
+
+##Add this argument to the phyloseq object call when you want to add meta data.
+##sample_data(final_cat_Edgar_metadata), #change sample_data file to whatever you named it in the above code chunk
+```
+
+
+##save unique sequences to a file for use in qiime.
+```{r}
+a<-colnames(otu_table(snow_ps_mergeFix_BAs))
+uniquesToFasta(seqtab.nochim, "/Volumes/Honeyman_LabData/Full_Protocols/june_seq/fixing_merge/uniques_snow_BAs.fasta", ids = a)
+```
+
+##testing a small fasta file.
+```{r}
+uniquesToFasta(test, "/Users/alexhoneyman/Desktop/test.fasta")
+```
+#aligning the small test fasta file.
+```{bash}
+python /Users/alexhoneyman/anaconda/envs/qiime1/bin/parallel_align_seqs_pynast.py -t "/Users/alexhoneyman/Desktop/for_alignment/90_otus_aligned.fasta" -i /Users/alexhoneyman/Desktop/test.fasta -o /Users/alexhoneyman/Desktop/test_aligned -T -O 2
+```
+
+##save unique sequences to a file for use in qiime. Same code as above, but here the unique sequences file generated contains only snow samples.
+```{r}
+a<-colnames(otu_table(snow_ps_snowOTUsOnly))
+uniquesToFasta(snow.seqtab.nochim_rmd, "/Volumes/Honeyman_LabData/Full_Protocols/june_seq/snow_alignment/uniques_snow.fasta", ids = a)
+
+```
+
+#Subsetting BOTH the snow_ps_snowOTUsOnly otu_table AND the snow.seqtab.nochim_rmd sequence table to <1000 sequence chunks. Due to processing power, we will use the SINA aligner (Silva) which can only accomodate 1000 or fewer sequences on the web interface.
+```{r}
+otu_sub_1 <- otu_table(snow_ps_snowOTUsOnly)[,1:1000]
+otu_sub_2 <- otu_table(snow_ps_snowOTUsOnly)[,1001:1695]
+
+seqtab_sub_1 <- snow.seqtab.nochim_rmd[,1:1000]
+seqtab_sub_2 <- snow.seqtab.nochim_rmd[,1001:1695]
+
+```
+#Note that the below is the same code chunk as above, but we are performing it on the updated data once the merging issue was fixed.
+#Subsetting BOTH the snow_ps_mergeFix_BAs otu_table AND the seqtab.nochim sequence table to <1000 sequence chunks. Due to processing power, we will use the SINA aligner (Silva) which can only accomodate 1000 or fewer sequences on the web interface.
+```{r}
+mrgFix_otu_sub_1 <- otu_table(snow_ps_mergeFix_BAs)[,1:1000]
+mrgFix_otu_sub_2 <- otu_table(snow_ps_mergeFix_BAs)[,1001:1711]
+
+mrgFix_seqtab_sub_1 <- seqtab.nochim[,1:1000]
+mrgFix_seqtab_sub_2 <- seqtab.nochim[,1001:1711]
+
+```
+##save unique sequences to a file for use in SINA. Two different fasta files are made, since SINA online can only accomodate 1000 sequences or less. Will need to concatenate these two fasta files when finished.
+```{r}
+a1<-colnames(otu_sub_1)
+uniquesToFasta(seqtab_sub_1, "/Users/alexhoneyman/Desktop/for_alignment/uniques_snow_sub1.fasta", ids = a1)
+
+a2<-colnames(otu_sub_2)
+uniquesToFasta(seqtab_sub_2, "/Users/alexhoneyman/Desktop/for_alignment/uniques_snow_sub2.fasta", ids = a2)
+
+```
+#The below is the same code chunk as above, but performed on the data that was fixed for the merging issue.
+##save unique sequences to a file for use in SINA. Two different fasta files are made, since SINA online can only accomodate 1000 sequences or less. Will need to concatenate these two fasta files when finished.
+```{r}
+m1<-colnames(mrgFix_otu_sub_1)
+uniquesToFasta(mrgFix_seqtab_sub_1, "/Volumes/Honeyman_LabData/Full_Protocols/june_seq/fixing_merge/for_SINA_alignment/mrgFix_uniques_sub1.fasta", ids = m1)
+
+m2<-colnames(mrgFix_otu_sub_2)
+uniquesToFasta(mrgFix_seqtab_sub_2, "/Volumes/Honeyman_LabData/Full_Protocols/june_seq/fixing_merge/for_SINA_alignment/mrgFix_uniques_sub2.fasta", ids = m2)
+
+```
+
+##(EUK ANALYSIS FOR SNOW) save unique sequences to a file for use in SINA.
+```{r}
+library(seqinr)
+
+seqs <- as.list(colnames(otu_table(snow_ps_euks_trim_BAout)))
+
+write.fasta(sequences = seqs, names = seqs, as.string = TRUE, file.out = "/Users/alexhoneyman/Desktop/uniques_snow_euks_BAout.fasta", open = "w")
+
+```
+
+##Now we will go online and use the SINA aligner. For each of the two sub-fasta files, the parameters used were as follows:
+#SSU, bases remaining unaligned at the ends were removed, FASTA format, no compression, 90% sequence i.d.
+
+##set path to your qiime
+```{r}
+Sys.setenv(PATH = paste("/Users/alexhoneyman/anaconda/envs/qiime1/bin", Sys.getenv("PATH"),sep=":"))
+```
+
+##use qiime to align, filter, and make a tree.
+#Here we are using the Silva representative set to align the sequences. Note that greengenes is the default. We are running Silva here because it is good practice to build your tree with the same representative database that phylogeny were assigned with.
+#We are starting 2 jobs because this mac has 2 cores.
+##This step can be skipped if you use the Silva online tool SINA to do an alignment. We have done so (see some previous code chunks used as part of this step).
+```{bash}
+python /Users/alexhoneyman/anaconda/envs/qiime1/bin/parallel_align_seqs_pynast.py -i /Volumes/Honeyman_LabData/Full_Protocols/june_seq/snow_alignment/uniques_snow.fasta -o /Volumes/Honeyman_LabData/Full_Protocols/june_seq/snow_alignment/uniques_snow_aligned -T -O 2
+```
+
+#The lane mask fitler (default) in fitler_alignment.py only works for greengenes and the V4-5 region. IF using SINA alignment...: Since SINA attempts to do a full 16S alignment, we will need to use a maximum entropy model instead. This model will chop off regions from the attemped alignment that we do not have sequencing data for.
+```{bash}
+python /Users/alexhoneyman/anaconda/envs/qiime1/bin/filter_alignment.py -i /Volumes/Honeyman_LabData/Full_Protocols/june_seq/fixing_merge/for_SINA_alignment/Aligned/subs_aligned_cated.fasta -o /Volumes/Honeyman_LabData/Full_Protocols/june_seq/fixing_merge/for_SINA_alignment/Aligned/uniques_snow_mrgFixBA_aligned_pfiltered -e 0.001
+```
+
+#The folders and output/input file names shown here are correct. A few of these bash commands outut a folder, which is why you need not add a file extension name to some of the outputs.
+```{bash}
+python /Users/alexhoneyman/anaconda/envs/qiime1/bin/make_phylogeny.py -i /Volumes/Honeyman_LabData/Full_Protocols/june_seq/fixing_merge/for_SINA_alignment/Aligned/uniques_snow_mrgFixBA_aligned_pfiltered/subs_aligned_cated_pfiltered.fasta
+```
+#Trying the same code as above, but with SINA alignments that have not been filtered.
+```{bash}
+python /Users/alexhoneyman/anaconda/envs/qiime1/bin/make_phylogeny.py -i /Volumes/Honeyman_LabData/Full_Protocols/june_seq/snow_alignment/for_alignment_SINA/uniques_snow_aligned.fasta
+```
+
+##Alpha diversity (doesn't need a tree). Here we plot the unnormalized alpha diversities; i.e. sequencing depth is not accounted for. These charts are also not rarefied (though rarefaction is probably better... so see next code segment).
+```{r, message=FALSE, warning=FALSE, include=FALSE}
+
+#Plotting by sample name.
+p <- plot_richness(snow_ps, x = "Sample", measures=c("Observed","Shannon"),color=NULL) 
+
+#Plotting by Location.
+q <- plot_richness(snow_ps, x = "Location", measures=c("Observed","Shannon"),color=NULL)  
+
+#Note you will have to run "p" and "q" in the console to chart the data in the plot interface.
+```
+
+
+##PAPER FIGURE IS HERE. Alpha diversity (doesn't need a tree). These alpha diversity charts have been rarefied.
+```{r, message=FALSE, warning=FALSE, include=FALSE}
+
+#Plotting by storm genesis.
+p <- plot_richness(snow_low_rare, x = "storm_genesis", measures=c("Shannon"),color="storm_genesis") 
+
+#Plotting by Location.
+q <- plot_richness(snow_low_rare, x = "Location", measures="Shannon")
+
+#For paper. Export as PDF, 3"x5", Portrait. Possibly will need to scale whole image in Illustrator, though 3"width is less than 3.4" which is ~1/2 width of a print page.
+alpha_chart <- q + theme(plot.title = element_text(hjust = 0.5)) + theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), panel.background = element_blank(), axis.line = element_line(colour = "black"), axis.text = element_text(size = 14), axis.title = element_text(size = 14)) + facet_null() + scale_x_discrete(expand=c(1, 0)) + geom_point(size = 3) + coord_fixed(ratio = 1)
+
+#For paper supplementary info.
+alpha_chart_supp <- p + ggtitle("Shannon Alpha Diversity by Storm Origin") + theme(plot.title = element_text(hjust = 0.5)) + theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), panel.background = element_blank(), axis.line = element_line(colour = "black")) + facet_null() + scale_x_discrete(expand=c(1, 0)) + geom_point(size = 3) + coord_fixed(ratio = 1)
+
+#Note you will have to run "p" and "q" in the console to chart the data in the plot interface.
+```
+
+
+##Making an updated sample_data table with obersved alphas as a new column.
+```{r}
+
+logic_table <- (data.frame(otu_table(snow_ps)) != 0) #otu present or not?
+observed_alphas <- data.frame(rowSums(logic_table))# add up presence/absence
+update_table <- sample_data(snow_ps)#make a copy table
+update_table[,6] <- observed_alphas[,1]#add the observed alpha value to table
+colnames(update_table)[6] <- "observed_alphas" #Name the new column
+write.csv(update_table, file = "/Users/alexhoneyman/Desktop/update_table.csv") #Write the table to a csv for manipulation in xcel.
+
+#Now make any changes/calculations that you want in xcel and reimport the data table to update the sequence_data.
+
+```
+
+#Read in the updated table and overwrite the old sample_data in the phyloseq object.
+```{r}
+#update_table <- read.csv(file = "/Users/alexhoneyman/Desktop/update_table.csv")
+update_table <- data.frame(mrgFix_update_table)
+update_table <- update_table[,-1] #There is an extra sample name column added during import that needs to be removed.
+row.names(update_table) <- update_table$Sample #The row names need to be explicitly determined for phyloseq to know what's what.
+
+sample_data(snow_ps_mergeFix_BAs_tre) <- sample_data(update_table) #The call that updates the phyloseq object.
+
+```
+
+#(MINES PARK) Read in the updated table and overwrite the old sample_data in the phyloseq object.
+```{r}
+#update_table <- read.csv(file = "/Users/alexhoneyman/Desktop/update_table.csv")
+minespark_meta <- data.frame(minespark_meta)
+minespark_meta <- minespark_meta[,-1] #There is an extra sample name column added during import that needs to be removed.
+row.names(minespark_meta) <- minespark_meta$Sample #The row names need to be explicitly determined for phyloseq to know what's what.
+
+sample_data(minespark_ps) <- sample_data(minespark_meta) #The call that updates the phyloseq object.
+
+```
+
+#Plotting the new normalized alphas (alphas/depth).
+```{r}
+
+p <- ggplot(sample_data(snow_ps), aes(x = Location, y = alphas_per_depth)) + geom_point() + theme(axis.text.x = element_text(angle = 270, hjust = 1))
+
+
+```
+
+##Plotting qPCR data.
+```{r}
+p <- ggplot(sample_data(snow_ps), aes(x= Location, y= ngEX_per_mL_filt)) + geom_point() + theme(axis.text.x = element_text(angle = 270, hjust = 1))
+
+```
+
+##add tree for beta diversity
+```{r}
+library(ape)
+tree_Q = read.tree("/Volumes/Honeyman_LabData/Full_Protocols/june_seq/fixing_merge/for_SINA_alignment/Aligned/uniques_snow_mrgFixBA_aligned_pfiltered/subs_aligned_cated_pfiltered.tre")
+tree_Q = root(tree_Q, 1, resolve.root = T)
+snow_ps_mergeFix_BAs_tre=merge_phyloseq(snow_ps_mergeFix_BAs, tree_Q)#this phyloseq object now has a tree
+```
+
+##save phyloseq object
+```{r}
+saveRDS(snow_ps_mergeFix_BAs_tre, '/Volumes/Honeyman_LabData/Full_Protocols/june_seq/subset_phyloseqs/snow_ps_mergeFix_BAs_tre.RDS')
+#saves the phyloseq object.  Can be read back in using readRDS
+```
+
+
+
+
+
+###This step and ones below it caluclate rarefaction curves. This set of code was redeveloped via the mines park workflow and works well for showing rarefaction curves.
+#calculate alpha diversity
+```{r}
+set.seed(42)
+
+calculate_rarefaction_curves <- function(psdata, measures, depths) {
+  require('plyr') # ldply
+  require('reshape2') # melt
+
+  estimate_rarified_richness <- function(psdata, measures, depth) {
+    if(max(sample_sums(psdata)) < depth) return()
+    psdata <- prune_samples(sample_sums(psdata) >= depth, psdata)
+
+    rarified_psdata <- rarefy_even_depth(psdata, depth, verbose = FALSE)
+
+    alpha_diversity <- estimate_richness(rarified_psdata, measures = measures)
+
+    # as.matrix forces the use of melt.array, which includes the Sample names (rownames)
+    molten_alpha_diversity <- melt(as.matrix(alpha_diversity), varnames = c('Sample', 'Measure'), value.name = 'Alpha_diversity')
+
+    molten_alpha_diversity
+  }
+
+  names(depths) <- depths # this enables automatic addition of the Depth to the output by ldply
+  rarefaction_curve_data <- ldply(depths, estimate_rarified_richness, psdata = psdata, measures = measures, .id = 'Depth', .progress = ifelse(interactive(), 'text', 'none'))
+
+  # convert Depth from factor to numeric
+  rarefaction_curve_data$Depth <- as.numeric(levels(rarefaction_curve_data$Depth))[rarefaction_curve_data$Depth]
+
+  rarefaction_curve_data
+}
+
+rarefaction_curve_data <- calculate_rarefaction_curves(snow_ps_mergeFix_BAs_tre, c('Observed', 'Shannon'), rep(c(1, 10, 100, 1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000, 9000, 10000, 12000, 14000), each = 10))
+summary(rarefaction_curve_data)
+
+```
+#sumarize alpha diversity
+```{r}
+rarefaction_curve_data_summary <- ddply(rarefaction_curve_data, c('Depth', 'Sample', 'Measure'), summarise, Alpha_diversity_mean = mean(Alpha_diversity), Alpha_diversity_sd = sd(Alpha_diversity))
+
+```
+#Add sample data
+```{r}
+rarefaction_curve_data_summary_verbose <- merge(rarefaction_curve_data_summary, data.frame(sample_data(snow_ps_mergeFix_BAs_tre)), by.x = 'Sample', by.y = 'row.names')
+
+```
+#Plot
+```{r}
+
+library('ggplot2')
+
+rarefaction_chart <- ggplot(
+  data = rarefaction_curve_data_summary,
+  mapping = aes(
+    x = Depth,
+    y = Alpha_diversity_mean,
+    ymin = Alpha_diversity_mean - Alpha_diversity_sd,
+    ymax = Alpha_diversity_mean + Alpha_diversity_sd,
+    colour = Sample,
+    group = Sample
+  )
+) + geom_line(
+) + geom_pointrange(
+) + facet_wrap(
+  facets = ~ Measure,
+  scales = 'free_y'
+) + scale_x_continuous(limits = c(0, 5000))
+
+```
+#Note that rarefying may be deprecated in a statistical sense. See publication on DESeq2 preference, instead, on Mendeley - Bioinformatics.
+
+
+
+#Rename samples.
+```{r}
+#Import a data.frame with the desired new names (must be same length as the current names list).
+sample_names(june_ps_update_t_gg) <- june_seq_meta_for_names$Sample
+sample_names(june_ps_update_t_gg)
+```
+
+
+#Subset the overall sequencing run phyloseq object into a phyloseq object for each project.
+```{r}
+snow_ps <- subset_samples(june_ps_update_t_gg, Project == "Snow")
+minespark_ps <- subset_samples(june_ps_update_t_gg, Project == "MinesPark")
+edgar_ps <- subset_samples(june_ps_update_t_gg, Project == "Edgar")
+
+#Then, update the sample data of the snow project using the updated table saved to the Data Drive. There is code written earlier in the Notebook to do this.
+
+```
+
+
+##Saving independent phyloseq objects for each project from the June sequencing run.
+##save phyloseq object
+```{r}
+saveRDS(snow_ps_snowOTUsOnly_silvaTax_SilvaTre_paper_noCtls_noEuks_noChlor_noMito, '/Volumes/Honeyman_LabData/Full_Protocols/june_seq/subset_phyloseqs/snow_ps_snowOTUsOnly_silvaTax_SilvaTre_paper_noCtls_noEuks_noChlor_noMito.RDS')
+#saves the phyloseq object.  Can be read back in using readRDS
+```
+
+
+##Rarefaction of MOST snow samples.
+```{r}
+snow_mrgFix_rare = rarefy_even_depth(snow_ps_mergeFix_BAs_tre, sample.size = 1500, rngseed = 711)
+
+sample_sums(snow_mrgFix_rare)
+
+```
+#Removing certain taxa groups that are uninformative for a Bacterial/Archaeal analysis. i.e. we remove Eukaryota, Chloroplasts, and Mitochondria.
+```{r}
+for_sub_taxa <- snow_mrgFix_rare
+
+snow_noEuk_noChlor_noMito <- subset_taxa(for_sub_taxa, ((Kingdom != "Eukaryota")&(Class != "Chloroplast")&(Family != "Mitochondria")))
+
+
+```
+#Removing the control filters so that they are not part of ordination distance matrices.
+```{r}
+snow_noEuk_noChlor_noMito_noCtl <- subset_samples(snow_noEuk_noChlor_noMito, Location != "Control")
+
+```
+#Removing 111716_Golden_2 from anlaysis because the bead tube failed during extraction.
+```{r}
+snow_noEuk_noChlor_noMito_noCtl_trim <- subset_samples(snow_noEuk_noChlor_noMito_noCtl, Sample != "111716_Golden_2")
+
+```
+#To resolve the effect of certain metadata variables, one may need to separate samples based upon highly influential variables. i.e. in the snow work we see that sampling location has a large effect on community ordination, so to tease out other factors controlling ordination- we may want to view the Golden and Sunshine samples separately from one another. Code to subset rarefied-analysis-ready data below.
+```{r}
+snow_4analysis_G <- subset_samples(snow_noEuk_noChlor_noMito_noCtl_trim, Location == "Golden")
+
+snow_4analysis_S <- subset_samples(snow_noEuk_noChlor_noMito_noCtl_trim, Location == "Sunshine")
+```
+
+##Rarefaction of SNOW EUKS.
+#Note that here we are not using the ps object with the tree. Adding the tree removed the vast majority of OTUs from the object; no point in looking at only 4 OTUs on a tree since so many were removed due to failure to place on a phylogenetic tree.
+#Also note that 'trim' in this object indicates that control filters were removed as well as 111716_Golden_2 (the sample with the failed bead beating tube). The controls and 111716_Golden_2 were also removed from the rarefied object used for B/A analysis.
+```{r}
+snow_euks_rare = rarefy_even_depth(snow_ps_euks_trim_BAout, sample.size = 109, rngseed = 711)
+
+sample_sums(snow_euks_rare)
+
+```
+
+##Rarefaction of minespark samples.
+```{r}
+minespark_4800_rare = rarefy_even_depth(minespark_ps, sample.size = 4800)
+
+sample_sums(minespark_4800_rare)
+
+```
+
+#Extracting information from the phyloseq object such that ampvis2 can handle it. SNOW BACTERIAL/ARCHAEAL.
+```{r}
+#Combine OTU abundance table and taxonomy table from the phyloseq object:
+
+obj <- snow_noEuk_noChlor_noMito_noCtl_trim
+t_otu <- t(data.frame(otu_table(obj)))
+otutable_4ampvis2 <- data.frame(OTU = rownames(t_otu@.Data),
+                       t_otu@.Data,
+                       phyloseq::tax_table(obj)@.Data,
+                       check.names = FALSE
+                       )
+
+#We do not have Species data assigned via Silva, but ampvis2 requires a column of this name in order for data to be imported. So, we simply add an additional column at the end of the combined OTU-taxa table named 'Species' with all rows as 'NA'. How to calculate what index this column needs to go at: 1 OTU column + 26 sample names + 6 Silva taxa levels = 33. So... the 34th column is where this new Species column needs to be added.
+otutable_4ampvis2[34] <- "NA"
+colnames(otutable_4ampvis2)[34] <- "Species"
+
+#Extract metadata from the phyloseq object:
+metadata_4ampvis2 <- data.frame(phyloseq::sample_data(obj), 
+                       check.names = FALSE
+                       )
+
+#Load the data with amp_load:
+ampvis2_snowBA <- amp_load(otutable_4ampvis2, metadata_4ampvis2)
+```
+
+#Extracting information from the phyloseq object such that ampvis2 can handle it. SNOW EUKS.
+```{r}
+#Combine OTU abundance table and taxonomy table from the phyloseq object:
+
+obj <- snow_euks_rare
+t_otu <- t(data.frame(otu_table(obj)))
+otutable_4ampvis2 <- data.frame(OTU = rownames(t_otu@.Data),
+                       t_otu@.Data,
+                       phyloseq::tax_table(obj)@.Data,
+                       check.names = FALSE
+                       )
+
+#We do not have Species data assigned via Silva, but ampvis2 requires a column of this name in order for data to be imported. So, we simply add an additional column at the end of the combined OTU-taxa table named 'Species' with all rows as 'NA'. How to calculate what index this column needs to go at: 1 OTU column + 26 sample names + 6 Silva taxa levels = 33. So... the 34th column is where this new Species column needs to be added.
+otutable_4ampvis2[34] <- "NA"
+colnames(otutable_4ampvis2)[34] <- "Species"
+
+#Extract metadata from the phyloseq object:
+metadata_4ampvis2 <- data.frame(phyloseq::sample_data(obj), 
+                       check.names = FALSE
+                       )
+
+#Load the data with amp_load:
+ampvis2_snowEuks <- amp_load(otutable_4ampvis2, metadata_4ampvis2)
+```
+
+#Extracting information from the phyloseq object such that ampvis2 can handle it. FULL JUNE SEQ. TO LOOK AT CONTROLS, ETC.
+```{r}
+#Combine OTU abundance table and taxonomy table from the phyloseq object:
+
+june_all_rare <- rarefy_even_depth(june_ps_update_t_gg, 1500)
+
+obj <- june_all_rare
+t_otu <- t(data.frame(otu_table(obj)))
+otuJUNE_4ampvis2 <- data.frame(OTU = rownames(t_otu@.Data),
+                       t_otu@.Data,
+                       phyloseq::tax_table(obj)@.Data,
+                       check.names = FALSE
+                       )
+
+#We do not have Species data assigned via Silva, but ampvis2 requires a column of this name in order for data to be imported. So, we simply add an additional column at the end of the combined OTU-taxa table named 'Species' with all rows as 'NA'. How to calculate what index this column needs to go at: 1 OTU column + 26 sample names + 6 Silva taxa levels = 33. So... the 34th column is where this new Species column needs to be added.
+otuJUNE_4ampvis2[68] <- "NA"
+colnames(otuJUNE_4ampvis2)[68] <- "Species"
+
+#Extract metadata from the phyloseq object:
+metaJUNE_4ampvis2 <- data.frame(phyloseq::sample_data(obj), 
+                       check.names = FALSE
+                       )
+
+#Load the data with amp_load:
+ampvis2_allJUNE <- amp_load(otuJUNE_4ampvis2, metaJUNE_4ampvis2)
+```
+
+##ampvis2 charts (SNOW B/A). PAPER TAXA INFO IS HERE.
+```{r}
+
+BA_h_loc <- amp_heatmap(ampvis2_snowBA, group_by = "Location")
+
+BA_h_loc_class <- amp_heatmap(ampvis2_snowBA, group_by = "Location", tax_add = "Class")
+
+BA_h_storm <- amp_heatmap(ampvis2_snowBA, group_by = "storm_genesis")
+
+BA_h_storm_class <- amp_heatmap(ampvis2_snowBA, group_by = "storm_genesis", tax_add = "Class")
+
+#Reports the alpha diveristy w/ respect to several metrics here for each sample. We can go back to the data table produced by this call and run stats on the alpha diversities by group.
+ampvis2_BA_alphas <- amp_alphadiv(ampvis2_snowBA)
+
+```
+
+##ampvis2 charts (SNOW EUKS). PAPER TAXA INFO IS HERE.
+```{r}
+
+Euks_h_loc <- amp_heatmap(ampvis2_snowEuks, group_by = "Location", tax_empty = "remove")
+
+Euks_h_loc_class <- amp_heatmap(ampvis2_snowEuks, group_by = "Location", tax_empty = "remove", tax_add = "Class")
+
+Euks_h_storm <- amp_heatmap(ampvis2_snowEuks, group_by = "storm_genesis", tax_empty = "remove")
+
+Euks_h_storm_class <- amp_heatmap(ampvis2_snowEuks, group_by = "storm_genesis", tax_empty = "remove", tax_add = "Class")
+
+#Reports the alpha diveristy w/ respect to several metrics here for each sample. We can go back to the data table produced by this call and run stats on the alpha diversities by group.
+ampvis2_Euks_alphas <- amp_alphadiv(ampvis2_snowEuks)
+
+```
+
+##ampvis2 charts (ALL JUNE).
+```{r}
+
+all_june_heatmap <- amp_heatmap(ampvis2_allJUNE, tax_empty = "remove")
+
+```
+
+#Panels of the heatmaps generated in ampvis2 (above). PAPER FIGURES ARE HERE.
+```{r}
+
+BA_h_class_panel <- plot_grid(BA_h_loc_class, BA_h_storm_class, labels = c("A", "B"))
+
+Euks_h_class_panel <- plot_grid(Euks_h_loc_class, Euks_h_storm_class, labels = c("A", "B"))
+
+```
+
+#Core microbiome (SNOW). Looking at classes with 5% rel. abund.
+```{r}
+library(ampvis)
+for_amp <- snow_low_rare #assign rarefied ps2 object to for_amp
+
+#transpose the otu table.  Ampvis needs this.
+otu_table(for_amp) = t(otu_table(for_amp))
+
+#normalize sample counts to 100, this allows us to visualize percentage.
+for_amp <- transform_sample_counts(for_amp, function(x) x / sum(x) * 100)
+
+#Plotting an amp_core
+core <- amp_core(data = for_amp, plot.type = "core", abund.treshold = 5, tax.aggregate = "Class", tax.empty = "remove", scale.seq = 100)
+
+```
+#Subsetting to Golden and Sunshine samples separately. For use with a core microbiome... looking for OTUs specific to each.
+```{r}
+Sunshine_for_core <- subset_samples(snow_low_rare, Location=="Sunshine")
+
+Golden_for_core <- subset_samples(snow_low_rare, Location=="Golden")
+
+NW_for_core <- subset_samples(snow_low_rare, storm_genesis=="NW")
+
+SE_for_core <- subset_samples(snow_low_rare, storm_genesis=="SE")
+
+SW_for_core <- subset_samples(snow_low_rare, storm_genesis=="SW")
+```
+#Core microbiome (SNOW). Looking for over-abundant OTUs. Change the 'output' parameter back to "plot" if you want to chart these cores.
+```{r}
+library(ampvis)
+
+for_amp <- Sunshine_for_core #assign rarefied ps2 object to for_amp
+#transpose the otu table.  Ampvis needs this.
+otu_table(for_amp) = t(otu_table(for_amp))
+#normalize sample counts to 100, this allows us to visualize percentage.
+for_amp <- transform_sample_counts(for_amp, function(x) x / sum(x) * 100)
+#Plotting an amp_core
+core_s <- amp_core(data = for_amp, plot.type = "core", output = "plot", abund.treshold = 5, tax.aggregate = "OTU", tax.empty = "remove", scale.seq = 100)
+
+for_amp <- Golden_for_core #assign rarefied ps2 object to for_amp
+#transpose the otu table.  Ampvis needs this.
+otu_table(for_amp) = t(otu_table(for_amp))
+#normalize sample counts to 100, this allows us to visualize percentage.
+for_amp <- transform_sample_counts(for_amp, function(x) x / sum(x) * 100)
+#Plotting an amp_core
+core_g <- amp_core(data = for_amp, plot.type = "core", output = "plot", abund.treshold = 5, tax.aggregate = "OTU", tax.empty = "remove", scale.seq = 100)
+
+for_amp <- NW_for_core #assign rarefied ps2 object to for_amp
+#transpose the otu table.  Ampvis needs this.
+otu_table(for_amp) = t(otu_table(for_amp))
+#normalize sample counts to 100, this allows us to visualize percentage.
+for_amp <- transform_sample_counts(for_amp, function(x) x / sum(x) * 100)
+#Plotting an amp_core
+core_NW <- amp_core(data = for_amp, plot.type = "core", output = "plot", abund.treshold = 5, tax.aggregate = "OTU", tax.empty = "remove", scale.seq = 100)
+
+for_amp <- SE_for_core #assign rarefied ps2 object to for_amp
+#transpose the otu table.  Ampvis needs this.
+otu_table(for_amp) = t(otu_table(for_amp))
+#normalize sample counts to 100, this allows us to visualize percentage.
+for_amp <- transform_sample_counts(for_amp, function(x) x / sum(x) * 100)
+#Plotting an amp_core
+core_SE <- amp_core(data = for_amp, plot.type = "core", output = "plot", abund.treshold = 5, tax.aggregate = "OTU", tax.empty = "remove", scale.seq = 100)
+
+for_amp <- SW_for_core #assign rarefied ps2 object to for_amp
+#transpose the otu table.  Ampvis needs this.
+otu_table(for_amp) = t(otu_table(for_amp))
+#normalize sample counts to 100, this allows us to visualize percentage.
+for_amp <- transform_sample_counts(for_amp, function(x) x / sum(x) * 100)
+#Plotting an amp_core
+core_SW <- amp_core(data = for_amp, plot.type = "core", output = "plot", abund.treshold = 5, tax.aggregate = "OTU", tax.empty = "remove", scale.seq = 100)
+```
+#Pulling out specific OTUs from core plots.
+```{r}
+#On the core charts generated, we specify a 'square' of the chart from which to pull points from. i.e. Frequency and freq_A correspond to x and y axis thresholds, respectively.
+OTUs_core_s <- filter(core_s$data, Frequency > 8, freq_A > 4) %>% 
+             select(OTU, Abundance, Phylum, Class, Order) %>%
+             arrange(desc(Abundance))
+
+OTUs_core_g <- filter(core_g$data, Frequency > 8, freq_A > 1) %>% 
+             select(OTU, Abundance, Phylum, Class, Order) %>%
+             arrange(desc(Abundance))
+
+OTUs_core_NW <- filter(core_NW$data, Frequency > 3, freq_A > 1) %>% 
+             select(OTU, Abundance, Phylum, Class, Order) %>%
+             arrange(desc(Abundance))
+
+OTUs_core_SE <- filter(core_SE$data, Frequency > 1, freq_A > 1) %>% 
+             select(OTU, Abundance, Phylum, Class, Order) %>%
+             arrange(desc(Abundance))
+
+OTUs_core_SW <- filter(core_SW$data, Frequency > 10, freq_A > 2) %>% 
+             select(OTU, Abundance, Phylum, Class, Order) %>%
+             arrange(desc(Abundance))
+
+```
+
+#Loading better color palletes.
+```{r}
+library(wesanderson)
+```
+
+#Bar charts using phyloseq data.
+```{r}
+p <- plot_bar(snow_low_rare, x="Location", fill="Phylum") + geom_bar(aes(color=Phylum, fill = Phylum), stat="identity", position="stack") #+ scale_color_brewer(palette="Dark2")
+
+q <- plot_bar(snow_low_rare, x="storm_genesis", fill="Phylum") + geom_bar(aes(color=Phylum, fill = Phylum), stat="identity", position="stack") #+ scale_color_brewer(palette="Dark2")
+
+```
+
+
+
+##PCoA, unweighted unifrac.
+```{r}
+ord = ordinate(snow_noEuk_noChlor_noMito_noCtl, method = "PCoA", distance = "unifrac", weighted = FALSE)
+
+
+q<-plot_ordination(snow_noEuk_noChlor_noMito_noCtl, ord, title = "PCoA of Unweighted Unifrac", color = "Location", label = "Sample")
+
+p<-plot_ordination(snow_noEuk_noChlor_noMito_noCtl, ord, title = "PCoA of Unweighted Unifrac", color = "comb_season", label = "Sample", shape = "Location")
+
+r<-plot_ordination(snow_noEuk_noChlor_noMito_noCtl, ord, color = "comb_storm_genesis") + scale_color_brewer(palette = "Set1")
+
+#Paper figure. Export as PDF, 5"x3", Portrait. Will need to scale whole image in illustrtor to get it down to ~3.4"x3".
+pcoa_by_storm <- r + theme(plot.title = element_text(hjust = 0.5), axis.text = element_text(size = 8), axis.title = element_text(size = 8)) + labs(color = "Origin of Storm") + theme(legend.title = element_text(size = 5, hjust = 0.5), legend.text = element_text(size = 5)) + theme(legend.background = element_rect(fill="lightblue", size = 0.5, linetype="solid", colour ="darkblue")) + geom_point(size = 1.5) + theme(panel.grid.major = element_blank(), panel.grid.minor = element_line(color = "black", size = 0.05), panel.background = element_blank(), axis.line = element_line(colour = "black"))
+```
+
+##PCoA, Weighted unifrac: All rarefied snow samples.
+```{r}
+ord = ordinate(snow_noEuk_noChlor_noMito_noCtl, method = "PCoA", distance = "unifrac", weighted = TRUE)
+
+
+q<-plot_ordination(snow_noEuk_noChlor_noMito_noCtl, ord, title = "PCoA of Weighted Unifrac", color = "Location", label = "Sample")
+
+p<-plot_ordination(snow_noEuk_noChlor_noMito_noCtl, ord, title = "PCoA of Weighted Unifrac", color = "comb_season", label = "Sample", shape = "Location")
+
+r<-plot_ordination(snow_noEuk_noChlor_noMito_noCtl, ord, title = "PCoA of Weighted Unifrac", color = "comb_storm_genesis", label = "Sample", shape = "Location")
+```
+##PCoA, Weighted unifrac: Rarefied Golden samples alone
+```{r}
+ord = ordinate(snow_4analysis_G, method = "PCoA", distance = "unifrac", weighted = TRUE)
+
+
+q<-plot_ordination(snow_4analysis_G, ord, title = "PCoA of Weighted Unifrac", color = "Location", label = "Sample", shape = "comb_storm_genesis")
+
+p<-plot_ordination(snow_4analysis_G, ord, title = "PCoA of Weighted Unifrac", color = "comb_season", label = "Sample", shape = "Location")
+
+r<-plot_ordination(snow_4analysis_G, ord, title = "PCoA of Weighted Unifrac", color = "comb_storm_genesis", label = "Sample", shape = "Location")
+```
+##PCoA, Weighted unifrac: Rarefied Sunshine Samples Alone
+```{r}
+ord = ordinate(snow_4analysis_S, method = "PCoA", distance = "unifrac", weighted = TRUE)
+
+
+q<-plot_ordination(snow_4analysis_S, ord, title = "PCoA of Weighted Unifrac", color = "Location", label = "Sample", shape = "comb_storm_genesis")
+
+p<-plot_ordination(snow_4analysis_S, ord, title = "PCoA of Weighted Unifrac", color = "comb_season", label = "Sample", shape = "Location")
+
+r<-plot_ordination(snow_4analysis_S, ord, title = "PCoA of Weighted Unifrac", color = "comb_storm_genesis", label = "Sample", shape = "Location")
+```
+
+##PCoA, bray.
+```{r}
+ord = ordinate(snow_noEuk_noChlor_noMito_noCtl, method = "PCoA", distance = "bray")
+
+
+q<-plot_ordination(snow_noEuk_noChlor_noMito_noCtl, ord, type = "biplot", title = "PCoA of Bray Distance", color = "Location", label = "Sample", shape = "comb_storm_genesis")
+
+p<-plot_ordination(snow_noEuk_noChlor_noMito_noCtl, ord, type = "biplot", title = "PCoA of Bray Distance", color = "comb_storm_genesis", label = "Sample", shape = "Location")
+
+r<-plot_ordination(snow_noEuk_noChlor_noMito_noCtl, ord, type = "biplot", title = "PCoA of Bray Distance", color = "storm_genesis", label = "Sample", shape = "Location")
+```
+
+##NMDS, unweighted unifrac.
+```{r}
+ord = ordinate(snow_noEuk_noChlor_noMito_noCtl, method = "NMDS", distance = "unifrac", weighted = FALSE)
+
+
+q<-plot_ordination(snow_noEuk_noChlor_noMito_noCtl, ord, color = "Location") + scale_color_brewer(palette = "Set1")
+
+p<-plot_ordination(snow_noEuk_noChlor_noMito_noCtl, ord, title = "NMDS of Unweighted Unifrac", color = "comb_storm_genesis", label = "Sample", shape = "Location")
+
+r<-plot_ordination(snow_noEuk_noChlor_noMito_noCtl, ord, title = "NMDS of Unweighted Unifrac", color = "storm_genesis", label = "Sample", shape = "Location")
+
+#Paper figure. Export as PDF, 5"x3", Portrait. Will need to scale whole image in illustrtor to get it down to ~3.4"x3".
+nmds_by_location <- q + theme(plot.title = element_text(hjust = 0.5)) + labs(color = "Sampling Location") + theme(legend.title = element_text(size = 5, hjust = 0.5), legend.text = element_text(size = 5)) + theme(legend.background = element_rect(fill="lightblue", size=0.5, linetype="solid", colour ="darkblue")) + geom_point(size = 1.5) + theme(panel.grid.major = element_blank(), panel.grid.minor = element_line(color = "black", size = 0.05), panel.background = element_blank(), axis.line = element_line(colour = "black"))
+```
+
+##NMDS, Weighted unifrac. All samples. PAPER FIGURES ARE HERE.
+```{r}
+ord = ordinate(snow_noEuk_noChlor_noMito_noCtl_trim, method = "NMDS", distance = "unifrac", weighted = TRUE)
+
+
+q<-plot_ordination(snow_noEuk_noChlor_noMito_noCtl_trim, ord, color = "Location")
+
+p<-plot_ordination(snow_noEuk_noChlor_noMito_noCtl_trim, ord, color = "storm_genesis")
+
+r<-plot_ordination(snow_noEuk_noChlor_noMito_noCtl_trim, ord, title = "NMDS of Weighted Unifrac", color = "comb_season", label = "Sample")
+
+#Paper figures. Export as PDF, 5"x3", Portrait. Will need to scale whole image in illustrtor to get it down to ~3.4"x3".
+NMDS_by_Location <- q + theme(plot.title = element_text(hjust = 0.5), axis.text = element_text(size = 8), axis.title = element_text(size = 8)) + labs(color = "Sampling Location") + theme(legend.title = element_text(size = 5, hjust = 0.5), legend.text = element_text(size = 5)) + theme(legend.background = element_rect(fill="lightblue", size = 0.5, linetype="solid", colour ="darkblue")) + geom_point(size = 1.5) + theme(panel.grid.major = element_blank(), panel.grid.minor = element_line(color = "black", size = 0.05), panel.background = element_blank(), axis.line = element_line(colour = "black"))
+
+NMDS_by_storm_genesis <- p + theme(plot.title = element_text(hjust = 0.5), axis.text = element_text(size = 8), axis.title = element_text(size = 8)) + labs(color = "Origin of Storm") + theme(legend.title = element_text(size = 5, hjust = 0.5), legend.text = element_text(size = 5)) + theme(legend.background = element_rect(fill="lightblue", size = 0.5, linetype="solid", colour ="darkblue")) + geom_point(size = 1.5) + theme(panel.grid.major = element_blank(), panel.grid.minor = element_line(color = "black", size = 0.05), panel.background = element_blank(), axis.line = element_line(colour = "black"))
+
+```
+
+#Making a panel of the two NMDS plots. PAPER FIGURE IS HERE.
+```{r}
+
+NMDS_combined_paper <- plot_grid(NMDS_by_Location, NMDS_by_storm_genesis, labels = c("A", "B"))
+
+```
+
+##NMDS, Weighted unifrac. Sunshine samples only.
+```{r}
+ord = ordinate(snow_4analysis_S, method = "NMDS", distance = "unifrac", weighted = TRUE)
+
+
+q<-plot_ordination(snow_4analysis_S, ord, title = "NMDS of Weighted Unifrac", color = "Location", label = "Sample", shape = "comb_storm_genesis")
+
+p<-plot_ordination(snow_4analysis_S, ord, title = "NMDS of Weighted Unifrac", color = "comb_storm_genesis", label = "Sample", shape = "Location")
+
+r<-plot_ordination(snow_4analysis_S, ord, title = "NMDS of Weighted Unifrac", color = "comb_season", label = "Sample", shape = "Location")
+```
+##NMDS, Weighted unifrac. Golden samples only.
+```{r}
+ord = ordinate(snow_4analysis_G, method = "NMDS", distance = "unifrac", weighted = TRUE)
+
+
+q<-plot_ordination(snow_4analysis_G, ord, title = "NMDS of Weighted Unifrac", color = "Location", label = "Sample", shape = "comb_storm_genesis")
+
+p<-plot_ordination(snow_4analysis_G, ord, title = "NMDS of Weighted Unifrac", color = "storm_genesis", label = "Sample", shape = "Location")
+
+r<-plot_ordination(snow_4analysis_G, ord, title = "NMDS of Weighted Unifrac", color = "comb_season", label = "Sample", shape = "Location")
+```
+
+##NMDS, bray.
+```{r}
+ord = ordinate(snow_low_rare, method = "NMDS", distance = "bray")
+
+
+q<-plot_ordination(snow_low_rare, ord, title = "NMDS of Bray Distance", color = "Location", label = "Sample", shape = "comb_storm_genesis")
+
+p<-plot_ordination(snow_low_rare, ord, title = "NMDS of Bray Distance", color = "comb_storm_genesis", label = "Sample", shape = "Location")
+
+r<-plot_ordination(snow_low_rare, ord, title = "NMDS of Bray Distance", color = "storm_genesis", label = "Sample", shape = "Location")
+
+s <- q + geom_polygon(aes(fill=Location))
+```
+
+#Working on a constrained correspondence analysis (CCA) for snow samples/taxa as they correlate with environmental factors. We can see that Sampling Location appears to have the strongest grouping effect in ordinations, but you can also tease out storm_origin and seasonal differences when looking at the two Sampling Locations in isolation. CCA is nice because we can a priori constrain the analysis by grouping the data by Sampling Location AND comb_season; i.e. we KNOW this is a strong effect, and therefore constrain the analysis by this factor such that other factors (like taxa) contributing to sample differences can be highlited and plotted.
+```{r}
+cca_location_cseason = ordinate(snow_noEuk_noChlor_noMito_noCtl, method = "CCA", distance = "unifrac", weighted = TRUE, formula = snow_noEuk_noChlor_noMito_noCtl ~ Location * comb_season)
+
+biplot = plot_ordination(snow_noEuk_noChlor_noMito_noCtl, cca_location_cseason, type = "taxa", color = "Phylum")
+
+#Now we are generating the arrows for environmental data.
+arrowmat = vegan::scores(cca_location, display = "bp")
+
+#Adding labels and making a data frame.
+arrowdf <- data.frame(labels = rownames(arrowmat), arrowmat)
+
+#Defining the ggplot mapping aesthetic for arrows.
+arrow_map = aes(xend = CCA1, yend = CCA2, x = 0, y = 0, shape = NULL, color = NULL, label = labels)
+label_map = aes(x = 1.2 * CCA1, y = 1.2 * CCA2, shape = NULL, color = NULL, label = labels)
+arrowhead = arrow(length = unit(0.05, "npc"))
+
+#Building the new graphic.
+cca_plot = biplot + geom_segment(arrow_map, size = 0.5, data = arrowdf, color = "gray", arrow = arrowhead) + geom_text(label_map, size = 2, data = arrowdf)
+
+facet_cca <- cca_plot + facet_wrap(~Phylum)
+
+```
+
+
+#Adonis Test: by comb_season. These look at significance and effect size of various metadata variables on ordinations (i.e. distance matrices).
+```{r}
+#Making a dataframe out of the sample_data()
+snow.rare.data = as(sample_data(snow_noEuk_noChlor_noMito_noCtl), "data.frame")
+
+#Making sure that factor variables are non-continuous.
+snow.rare.data$comb_season <- as.factor(snow.rare.data$comb_season)
+
+#Building your distance matrix.
+snow.dist.matrix = phyloseq::distance(snow_noEuk_noChlor_noMito_noCtl, "wunifrac")
+
+#The function call for the adonis significance test. 999 permutations is considered acceptable.
+adonis(snow.dist.matrix ~ snow.rare.data$comb_season, permutations = 999, snow.rare.data)
+
+```
+
+#Adonis Test: by Location. These look at significance and effect size of various metadata variables on ordinations (i.e. distance matrices).
+```{r}
+#Making a dataframe out of the sample_data()
+snow.rare.data = as(sample_data(snow_noEuk_noChlor_noMito_noCtl_trim), "data.frame")
+
+#Making sure that factor variables are non-continuous.
+snow.rare.data$Location <- as.factor(snow.rare.data$Location)
+
+#Building your distance matrix.
+snow.dist.matrix = phyloseq::distance(snow_noEuk_noChlor_noMito_noCtl_trim, "wunifrac")
+
+#The function call for the adonis significance test. 999 permutations is considered acceptable.
+adonis(snow.dist.matrix ~ snow.rare.data$Location, permutations = 999, snow.rare.data)
+
+```
+
+#Adonis Test: by storm_genesis These look at significance and effect size of various metadata variables on ordinations (i.e. distance matrices).
+```{r}
+#Making a dataframe out of the sample_data()
+snow.rare.data = as(sample_data(snow_noEuk_noChlor_noMito_noCtl_trim), "data.frame")
+
+#Making sure that factor variables are non-continuous.
+snow.rare.data$storm_genesis <- as.factor(snow.rare.data$storm_genesis)
+
+#Building your distance matrix.
+snow.dist.matrix = phyloseq::distance(snow_noEuk_noChlor_noMito_noCtl_trim, "wunifrac")
+
+#The function call for the adonis significance test. 999 permutations is considered acceptable.
+adonis(snow.dist.matrix ~ snow.rare.data$storm_genesis, permutations = 999, snow.rare.data)
+
+```
+
+#Adonis Test: by comb_storm_genesis These look at significance and effect size of various metadata variables on ordinations (i.e. distance matrices).
+```{r}
+#Making a dataframe out of the sample_data()
+snow.rare.data = as(sample_data(snow_noEuk_noChlor_noMito_noCtl), "data.frame")
+
+#Making sure that factor variables are non-continuous.
+snow.rare.data$comb_storm_genesis <- as.factor(snow.rare.data$comb_storm_genesis)
+
+#Building your distance matrix.
+snow.dist.matrix = phyloseq::distance(snow_noEuk_noChlor_noMito_noCtl, "wunifrac")
+
+#The function call for the adonis significance test. 999 permutations is considered acceptable.
+adonis(snow.dist.matrix ~ snow.rare.data$comb_storm_genesis, permutations = 999, snow.rare.data)
+
+```
+
+
+#Ordianting via vegan and attempting to fit environmental data with envfit.
+```{r}
+#The distances used are calculated above in adonis.
+ord <- metaMDS(snow.dist.matrix)
+
+#Here we subset just to one variable to see how it impacts ordination; can be put as an argument into the envfit function call.
+sub_env <- snow.rare.data$NO3
+
+#The environmental fit.
+#If you place the entire data frame of metadata in as an argument, the envfit call will statistically evaluate how categorical AND continuous variables stack up against one another. i.e. you will get an r^2 and p value for how different the communities are that are associated with that variable. To see the p and r^2 values, just call 'fit' into the terminal without plotting it. If one plots 'fit', you will see the environmental vectors for ALL metadata on the chart, showing how they contribute to the variance displayed within the ordination.
+fit <- envfit(ord, snow.rare.data, perm = 999)
+
+#Plots and viewing scores.
+scores(fit, "vectors")
+plot(ord)
+plot(fit)
+
+```
+
+#T-test of the difference in Shannon alpha diversities between Sunshine and Golden.
+```{r}
+#Making a new dataframe with the Shannon alpha diversities as well as the Location factor.
+dat_alpha_stats <- data.frame(ampvis2_BA_alphas$Shannon)
+row.names(dat_alpha_stats) <- ampvis2_BA_alphas$Sample
+dat_alpha_stats[,2] <- ampvis2_BA_alphas$Location
+
+#Running a Welch Two sample t-test which assumes unequal group sizes being compared, groups are independent (not paired), and the variances of the two groups are not equal.
+library(stats)
+t.test(ampvis2_BA_alphas.Shannon ~ V2, data = dat_alpha_stats)
+
+```
+
+#T-test of the difference in Shannon alpha diversities between storm origins.
+```{r}
+#Making a new dataframe with the Shannon alpha diversities as well as the Location factor.
+dat_alpha_stats_storm <- data.frame(ampvis2_BA_alphas$Shannon)
+row.names(dat_alpha_stats_storm) <- ampvis2_BA_alphas$Sample
+dat_alpha_stats_storm[,2] <- ampvis2_BA_alphas$comb_storm_genesis
+
+#Running a Welch Two sample t-test which assumes unequal group sizes being compared, groups are independent (not paired), and the variances of the two groups are not equal.
+library(stats)
+t.test(ampvis2_BA_alphas.Shannon ~ V2, data = dat_alpha_stats_storm)
+
+```
+
+#T-test of the difference in Shannon alpha diversities between combined storm origins.
+```{r}
+#Making a new dataframe with the Shannon alpha diversities as well as the Location factor.
+dat_alpha_stats_cstorm <- data.frame(ampvis2_BA_alphas$Shannon)
+row.names(dat_alpha_stats_cstorm) <- ampvis2_BA_alphas$Sample
+dat_alpha_stats_cstorm[,2] <- ampvis2_BA_alphas$comb_storm_genesis
+
+#Running a Welch Two sample t-test which assumes unequal group sizes being compared, groups are independent (not paired), and the variances of the two groups are not equal.
+library(stats)
+t.test(ampvis2_BA_alphas.Shannon ~ V2, data = dat_alpha_stats_cstorm)
+
+```
+
+#T-test of the difference in Shannon alpha diversities between storm origins.
+```{r}
+#Making a new dataframe with the Shannon alpha diversities as well as the Location factor.
+dat_alpha_stats_storm <- data.frame(ampvis2_BA_alphas$Shannon)
+row.names(dat_alpha_stats_storm) <- ampvis2_BA_alphas$Sample
+dat_alpha_stats_storm[,2] <- ampvis2_BA_alphas$storm_genesis
+
+for_NW_SW <- dat_alpha_stats_storm[-c(1,4,8),]
+for_NW_SE <- dat_alpha_stats_storm[-c(5,7,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26),]
+for_SE_SW <- dat_alpha_stats_storm[-c(2,3,6,9,10),]
+
+#Running a Welch Two sample t-test which assumes unequal group sizes being compared, groups are independent (not paired), and the variances of the two groups are not equal.
+library(stats)
+
+#NW vs. SW
+t.test(ampvis2_BA_alphas.Shannon ~ V2, data = for_NW_SW)
+
+#NW vs. SE
+t.test(ampvis2_BA_alphas.Shannon ~ V2, data = for_NW_SE)
+
+#SE vs. SW
+t.test(ampvis2_BA_alphas.Shannon ~ V2, data = for_SE_SW)
+
+```
+
+
+
+
+
+
+
+
